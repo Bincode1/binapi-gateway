@@ -1,5 +1,6 @@
 package com.bin.bingateway;
 
+import com.alibaba.nacos.common.utils.StringUtils;
 import com.bin.binapiclientsdk.uitls.SignUtils;
 import com.bin.bincommon.model.InterfaceInfo;
 import com.bin.bincommon.model.User;
@@ -19,6 +20,7 @@ import org.springframework.core.io.buffer.DataBufferUtils;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
+import org.springframework.http.MediaType;
 import org.springframework.http.server.reactive.ServerHttpRequest;
 import org.springframework.http.server.reactive.ServerHttpResponse;
 import org.springframework.http.server.reactive.ServerHttpResponseDecorator;
@@ -49,41 +51,55 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
     @DubboReference
     InnerUserInterfaceInfoService innerUserInterfaceInfoService;
 
-    private static final String INTERFACEC_HOST = "http://localhost:8081";
+    private static final String INTERFACEC_HOST = "https://api.moonshot.cn/v1";
+    private static final String API_URL = "https://api.hunyuan.cloud.tencent.com";
 
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        ServerHttpResponse response = exchange.getResponse();
         System.out.println(System.currentTimeMillis() + "-------------------我的请求被网关拦截了，开始处理");
         log.info("custom global filter");
         System.out.println("custom global filter");
 //        1. 请求日志
         ServerHttpRequest request = exchange.getRequest();
+        HttpHeaders headers = request.getHeaders();
         log.info("请求唯一标识 " + request.getId());
-        String path = INTERFACEC_HOST + request.getPath().value();
+        String path = API_URL + request.getPath().value();
         String method = request.getMethod().toString();
-        log.info("请求参数 " + request.getQueryParams());
+        log.info("请求参数 ");
         log.info("请求来源地址" + request.getLocalAddress().getHostString());
-        log.info("请求来源地址" + request.getRemoteAddress());
-        String sourceAddress = request.getLocalAddress().getHostString();
-        ServerHttpResponse response = exchange.getResponse();
+        log.info("请求来源地址" + request.getRemoteAddress().getAddress().getHostAddress());
+
+        String xForwardedFor = headers.getFirst("X-Forwarded-For");
+        log.info("xForwardedFor 地址" + xForwardedFor);
+        String sourceAddress = null;
+        if (xForwardedFor == null || xForwardedFor.isEmpty()) {
+            // 如果没有X-Forwarded-For头，直接返回远程地址
+            sourceAddress = request.getRemoteAddress() != null
+                    ? request.getRemoteAddress().getAddress().getHostAddress()
+                    : null;
+        }
 //        2. 黑白名单
         if (!IP_WHITE_LIST.contains(sourceAddress)) {
             response.setStatusCode(HttpStatus.FORBIDDEN);
             return response.setComplete();
         }
 //        3. 用户鉴权（判断ak， sk是否合法）
-        HttpHeaders headers = request.getHeaders();
         String accessKey = headers.getFirst("accessKey");
         String nonce = headers.getFirst("nonce");
         String timestamp = headers.getFirst("timestamp");
         String sign = headers.getFirst("sign");
-        String body = headers.getFirst("body");
-        // 下面这两个值是需要去数据库中查，用户是否分配了这两个Key
+
+// 检查必要参数是否存在
+        if (!validateRequiredParams(accessKey, nonce, timestamp, sign)) {
+            return handlerInvalidParams(response, "缺少必要请求头参数");
+        }
         // 去数据库中查是否已分配给用户
         if (Long.parseLong(nonce) > 10000) {
             return handlerNoAuth(response);
         }
         // 时间和当前时间不能超过五分钟
+        assert timestamp != null;
         if (System.currentTimeMillis() / 1000 - Long.parseLong(timestamp) > 60 * 5) {
             return handlerNoAuth(response);
         }
@@ -99,7 +115,7 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
         }
 
         String secretkey = invokeUser.getSecretkey();
-        String serverSign = SignUtils.getSign(body, secretkey);
+        String serverSign = SignUtils.generateSignature(accessKey, secretkey, nonce, timestamp);
         if (sign == null || !sign.equals(serverSign)) {
             return handlerNoAuth(response);
         }
@@ -114,10 +130,12 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
         if (interfaceInfo == null) {
             return handlerNoAuth(response);
         }
-        // 5. 请求转发，调用模拟接口 + 相应日志
+        System.out.println("------------------网关层面的校验接口-------------:" + System.currentTimeMillis());
+        // 5. 请求转发，调用模拟接口 + 响应日志
         return handleResponse(exchange, chain, interfaceInfo.getId(), invokeUser.getId());
 
     }
+
 
     /**
      * 处理响应
@@ -182,11 +200,29 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
         }
     }
 
+
+
     @Override
     public int getOrder() {
         return -1;
     }
 
+    // 参数存在性校验方法
+    private boolean validateRequiredParams(String... params) {
+        for (String param : params) {
+            if (!StringUtils.hasText(param)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    // 统一错误处理方法
+    private Mono<Void> handlerInvalidParams(ServerHttpResponse response, String message) {
+        response.setStatusCode(HttpStatus.BAD_REQUEST);
+        response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
+        String jsonBody = String.format("{\"code\":400, \"msg\":\"%s\"}", message);
+        return response.writeWith(Mono.just(response.bufferFactory().wrap(jsonBody.getBytes())));
+    }
     public Mono<Void> handlerNoAuth(ServerHttpResponse response) {
         response.setStatusCode(HttpStatus.FORBIDDEN);
         return response.setComplete();
